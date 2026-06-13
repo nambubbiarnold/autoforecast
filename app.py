@@ -410,7 +410,20 @@ def run_sku_pipeline(sku_id, sku_df, cleaning_methods, model_names, metric="SMAP
                 val_p = val_m.predict(len(test_df), freq=freq)
                 val_metrics = all_metrics(test_df["y"].values, val_p["yhat"].values[:len(test_df)])
 
-                # Final forecast
+                # Train-fit metrics (in-sample) for overfitting detection
+                try:
+                    train_p = val_m.predict(len(c_train), freq=freq)
+                    train_metrics = all_metrics(c_train["y"].values, train_p["yhat"].values[:len(c_train)])
+                except Exception:
+                    train_metrics = {}
+
+                # Overfitting flag: test error > 2x train error on chosen metric = overfit
+                train_err = train_metrics.get(metric, 0)
+                test_err  = val_metrics.get(metric, 0)
+                overfit_ratio = (test_err / train_err) if train_err > 1 else 1.0
+                overfit_flag  = overfit_ratio > 2.5
+
+                # Final forecast — integers, floor 0
                 try:
                     fc_df = best_model.predict(horizon, freq=freq)
                 except Exception:
@@ -418,8 +431,14 @@ def run_sku_pipeline(sku_id, sku_df, cleaning_methods, model_names, metric="SMAP
                     last = sku_df["ds"].iloc[-1]
                     fc_df["ds"] = pd.date_range(start=last+pd.tseries.frequencies.to_offset(freq),periods=horizon,freq=freq)
 
+                # Enforce non-negative whole numbers on all forecast columns
+                for col in ["yhat","yhat_lower","yhat_upper"]:
+                    if col in fc_df.columns:
+                        fc_df[col] = np.maximum(0, fc_df[col]).round(0).astype(int)
+
                 results.append({"sku_id":sku_id,"cleaning":cleaning,"model":model_name,
                     "params":best_params,"score":best_score,"metrics":val_metrics,
+                    "train_metrics":train_metrics,"overfit_ratio":overfit_ratio,"overfit_flag":overfit_flag,
                     "model_obj":best_model,"forecast_df":fc_df,
                     "train_df":train_df,"test_df":test_df,"error":None})
                 log(f"  ✓ {sku_id} › {model_name} → {metric}={best_score:.3f}")
@@ -644,10 +663,17 @@ def render_results(results, metric_name):
     for sku_id,data in results.items():
         for i,r in enumerate(data.get("ranked",[])):
             m=r.get("metrics",{})
+            overfit = r.get("overfit_flag", False)
+            ratio   = r.get("overfit_ratio", 1.0)
             rows.append({"Rank":i+1,"SKU":sku_id,
                 "Cleaning":CLEANING_LABELS.get(r["cleaning"],r["cleaning"]),
-                "Model":r["model"],metric_name:round(r["score"],4),
-                "MAE":round(m.get("MAE",0),2),"RMSE":round(m.get("RMSE",0),2),
+                "Model":r["model"],
+                metric_name:round(r["score"],4),
+                "MAPE %":round(m.get("MAPE",0),2),
+                "MAE":round(m.get("MAE",0),2),
+                "RMSE":round(m.get("RMSE",0),2),
+                "Overfit?":"⚠️ Yes" if overfit else "✅ OK",
+                "Test/Train ratio":round(ratio,2),
                 "Best?":"⭐" if i==0 else ""})
     summary_df=pd.DataFrame(rows) if rows else pd.DataFrame()
 
@@ -668,6 +694,14 @@ def render_results(results, metric_name):
                 col.markdown(f'<div class="af-metric"><div class="label">{label}</div>'
                     f'<div class="value">{val}</div><div class="sub">{sub}</div></div>',unsafe_allow_html=True)
             st.markdown("---")
+            # Overfitting alert
+            overfit_skus=[row["SKU"] for _,row in best_df.iterrows() if row.get("Overfit?","")=="⚠️ Yes"]
+            if overfit_skus:
+                st.warning(f"⚠️ **Overfitting detected** on {len(overfit_skus)} SKU(s): {', '.join(overfit_skus)}. "
+                    f"The model fits training data well but performs poorly on the held-out test set. "
+                    f"Consider: fewer trials, simpler models, or more training data.")
+            else:
+                st.success("✅ No overfitting detected across all SKUs.")
             st.markdown("**Best pipeline per SKU**")
             st.dataframe(best_df,use_container_width=True,hide_index=True)
             hm=heatmap_chart(results,metric_name)
@@ -687,6 +721,9 @@ def render_results(results, metric_name):
                         all_fc.append(fc)
                 if all_fc:
                     all_fc_df=pd.concat(all_fc,ignore_index=True)
+                    for col in ["yhat","yhat_lower","yhat_upper"]:
+                        if col in all_fc_df.columns:
+                            all_fc_df[col]=np.maximum(0,all_fc_df[col]).round(0).astype(int)
                     buf2=io.StringIO(); all_fc_df.to_csv(buf2,index=False)
                     st.download_button("📈 All forecasts (CSV)",buf2.getvalue(),"all_forecasts.csv","text/csv")
             with dl3:
@@ -719,13 +756,17 @@ def render_results(results, metric_name):
                         st.plotly_chart(fig2,use_container_width=True)
                 if best.get("forecast_df") is not None:
                     fc=best["forecast_df"].copy()
+                    # Enforce whole numbers ≥ 0 (units)
                     for col in ["yhat","yhat_lower","yhat_upper"]:
-                        if col in fc.columns: fc[col]=fc[col].round(3)
-                    fc["ds"]=fc["ds"].astype(str)
-                    st.markdown("**Forecast values**")
+                        if col in fc.columns:
+                            fc[col]=np.maximum(0,fc[col]).round(0).astype(int)
+                    fc=fc.rename(columns={"yhat":"Forecast (units)","yhat_lower":"Lower (95%)","yhat_upper":"Upper (95%)"})
+                    fc["ds"]=fc["ds"].dt.strftime("%Y-%m-%d") if hasattr(fc["ds"],"dt") else fc["ds"].astype(str)
+                    fc=fc.rename(columns={"ds":"Date"})
+                    st.markdown("**Forecast values — whole units, floor 0**")
                     st.dataframe(fc,use_container_width=True,hide_index=True)
                     buf=io.StringIO(); fc.to_csv(buf,index=False)
-                    st.download_button(f"⬇️ {sel} forecast CSV",buf.getvalue(),f"forecast_{sel}.csv","text/csv")
+                    st.download_button(f"⬇️ Download {sel} forecast (CSV)",buf.getvalue(),f"forecast_{sel}.csv","text/csv")
             else:
                 st.warning(f"No successful forecast for {sel}")
 
@@ -735,21 +776,88 @@ def render_results(results, metric_name):
         if sel2:
             data=results[sel2]; ranked=data.get("ranked",[]); best=data.get("best")
             if best:
-                pipe_rows=[{"Cleaning":CLEANING_LABELS.get(r["cleaning"],r["cleaning"]),
-                    "Model":r["model"],metric_name:round(r["score"],4) if r["score"]<1e8 else "Failed",
-                    "Error":r.get("error","") or ""} for r in data.get("results",[])]
+                # ── Overfitting panel ──────────────────────────────────────
+                st.markdown("#### 🔬 Overfitting Diagnostics — Best Model")
+                tm = best.get("train_metrics",{}); vm = best.get("metrics",{})
+                ratio = best.get("overfit_ratio",1.0); flag = best.get("overfit_flag",False)
+                oc1,oc2,oc3,oc4 = st.columns(4)
+                oc1.metric("Train SMAPE",  f"{tm.get('SMAPE',0):.2f}%")
+                oc2.metric("Test SMAPE",   f"{vm.get('SMAPE',0):.2f}%",
+                    delta=f"+{vm.get('SMAPE',0)-tm.get('SMAPE',0):.2f}% vs train",
+                    delta_color="inverse")
+                oc3.metric("Test/Train ratio", f"{ratio:.2f}x",
+                    help="<1.5 = good · 1.5–2.5 = caution · >2.5 = overfitting")
+                oc4.metric("Overfit status", "⚠️ Overfit" if flag else "✅ OK")
+
+                if flag:
+                    st.warning("⚠️ **Overfitting detected.** The model memorises training data but fails on new data. "
+                        "Try: reduce Trials per pipeline · switch to Theta or Exp. Smoothing · increase test size.")
+                else:
+                    st.success("✅ Model generalises well — test error is within acceptable range of train error.")
+
+                # ── Full metrics table ─────────────────────────────────────
+                st.markdown("#### 📊 Full Validation Metrics — Best Model")
+                mc1,mc2,mc3,mc4,mc5 = st.columns(5)
+                for col,label,key in [(mc1,"SMAPE %","SMAPE"),(mc2,"MAPE %","MAPE"),
+                                      (mc3,"MAE","MAE"),(mc4,"RMSE","RMSE")]:
+                    col.metric(label, f"{vm.get(key,0):.2f}")
+                mc5.metric("Forecast type","Whole units ≥ 0")
+
+                st.markdown("---")
+                # ── All pipeline results ────────────────────────────────────
+                st.markdown("#### All pipeline results")
+                pipe_rows=[]
+                for r in data.get("results",[]):
+                    m2=r.get("metrics",{}); tm2=r.get("train_metrics",{})
+                    pipe_rows.append({
+                        "Cleaning":CLEANING_LABELS.get(r["cleaning"],r["cleaning"]),
+                        "Model":r["model"],
+                        metric_name:round(r["score"],4) if r["score"]<1e8 else "Failed",
+                        "MAPE %":round(m2.get("MAPE",0),2),
+                        "MAE":round(m2.get("MAE",0),2),
+                        "RMSE":round(m2.get("RMSE",0),2),
+                        "Train SMAPE":round(tm2.get("SMAPE",0),2),
+                        "Overfit?":"⚠️ Yes" if r.get("overfit_flag") else "✅ OK",
+                        "Error":r.get("error","") or ""})
                 if pipe_rows: st.dataframe(pd.DataFrame(pipe_rows),use_container_width=True,hide_index=True)
                 st.plotly_chart(comparison_bar(ranked,sel2,metric_name),use_container_width=True)
+
+                # ── Residuals plot ──────────────────────────────────────────
+                with st.expander("📉 Residuals analysis (best model)"):
+                    try:
+                        val_m2 = MODEL_REGISTRY[best["model"]](seed=42,**best.get("params",{}))
+                        val_m2.fit(apply_cleaning(best["train_df"],best["cleaning"]))
+                        val_p2 = val_m2.predict(len(best["test_df"]),freq=data.get("freq","MS"))
+                        actuals = best["test_df"]["y"].values
+                        preds   = val_p2["yhat"].values[:len(actuals)]
+                        residuals = actuals - preds
+                        fig_r = go.Figure()
+                        fig_r.add_trace(go.Bar(x=best["test_df"]["ds"],y=residuals,
+                            marker_color=[BRAND if r>=0 else "#ef4444" for r in residuals],
+                            name="Residual (actual − forecast)"))
+                        fig_r.add_hline(y=0,line_dash="dash",line_color="#7c6fad")
+                        fig_r.update_layout(title="Residuals — Random scatter = good · Patterns = model missing something",
+                            height=300,**THEME)
+                        st.plotly_chart(fig_r,use_container_width=True)
+                        bias = float(np.mean(residuals))
+                        st.caption(f"Mean bias: {bias:+.2f} units  "
+                            f"({'model tends to under-forecast' if bias>0 else 'model tends to over-forecast'})")
+                    except Exception as e:
+                        st.caption(f"Residuals not available: {e}")
+
+                # ── Model-specific extras ───────────────────────────────────
                 model_obj=best.get("model_obj")
                 if model_obj and best["model"]=="XGBoost" and hasattr(model_obj,"feature_importance_") and model_obj.feature_importance_ is not None:
-                    fi=model_obj.feature_importance_.head(15)
-                    fig=px.bar(fi,x="importance",y="feature",orientation="h",
-                        color="importance",color_continuous_scale=["#2a2750",BRAND])
-                    fig.update_layout(title="XGBoost Feature Importance",height=400,coloraxis_showscale=False,**THEME)
-                    st.plotly_chart(fig,use_container_width=True)
+                    with st.expander("📊 XGBoost Feature Importance"):
+                        fi=model_obj.feature_importance_.head(15)
+                        fig=px.bar(fi,x="importance",y="feature",orientation="h",
+                            color="importance",color_continuous_scale=["#2a2750",BRAND])
+                        fig.update_layout(title="Feature Importance",height=400,coloraxis_showscale=False,**THEME)
+                        st.plotly_chart(fig,use_container_width=True)
                 if model_obj and best["model"]=="ARIMA" and hasattr(model_obj,"aic") and model_obj.aic:
-                    st.info(f"AIC: {model_obj.aic:.2f}  |  BIC: {model_obj.bic:.2f}")
-                with st.expander("Best hyperparameters"):
+                    st.info(f"ARIMA — AIC: {model_obj.aic:.2f}  |  BIC: {model_obj.bic:.2f}  |  "
+                        f"Order: p={best['params'].get('p',1)} d={best['params'].get('d',1)} q={best['params'].get('q',1)}")
+                with st.expander("⚙️ Best hyperparameters"):
                     st.json(best.get("params",{}))
 
     # ── Reproducibility tab ───────────────────────────────────────────────
