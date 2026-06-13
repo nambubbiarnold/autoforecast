@@ -221,7 +221,7 @@ class ARIMAForecaster:
         dates=pd.date_range(start=pd.Timestamp(self._last_dates[-1])+pd.tseries.frequencies.to_offset(freq),periods=horizon,freq=freq)
         return pd.DataFrame({"ds":dates,"yhat":mean,"yhat_lower":lo,"yhat_upper":hi})
     def param_grid(self):
-        return {"p":[0,1,2],"d":[0,1],"q":[0,1,2],"P":[0,1],"D":[0,1],"Q":[0,1],"s":[0,12]}
+        return {"p":[1,2],"d":[0,1],"q":[0,1],"P":[0],"D":[0],"Q":[0],"s":[0]}
 
 class ESForecaster:
     name = "Exp. Smoothing"
@@ -253,7 +253,7 @@ class ESForecaster:
         dates=pd.date_range(start=self._last_date+pd.tseries.frequencies.to_offset(freq),periods=horizon,freq=freq)
         return pd.DataFrame({"ds":dates,"yhat":yhat,"yhat_lower":np.maximum(0,yhat-ci),"yhat_upper":yhat+ci})
     def param_grid(self):
-        return {"trend":["add","mul"],"damped_trend":[False,True],"seasonal":["add","mul"],"use_boxcox":[False,True]}
+        return {"trend":["add"],"damped_trend":[False],"seasonal":["add"],"use_boxcox":[False]}
 
 def _lag_features(series, lags=12):
     df=pd.DataFrame({"y":series})
@@ -289,8 +289,8 @@ class XGBoostForecaster:
         dates=pd.date_range(start=last_date+pd.tseries.frequencies.to_offset(freq),periods=horizon,freq=freq)
         return pd.DataFrame({"ds":dates,"yhat":yhat,"yhat_lower":yhat-1.96*std,"yhat_upper":yhat+1.96*std})
     def param_grid(self):
-        return {"n_estimators":[100,200,500],"max_depth":[3,4,6],"learning_rate":[0.01,0.05,0.1],
-                "subsample":[0.7,0.8,1.0],"reg_alpha":[0.0,0.1],"reg_lambda":[1.0,5.0]}
+        return {"n_estimators":[100,200],"max_depth":[3,4],"learning_rate":[0.05,0.1],
+                "subsample":[0.8],"reg_alpha":[0.0],"reg_lambda":[1.0]}
 
 class ThetaForecaster:
     name = "Theta"
@@ -492,7 +492,7 @@ def heatmap_chart(results_by_sku, metric_name):
 # ══════════════════════════════════════════════════════════════════════════════
 # SESSION STATE
 # ══════════════════════════════════════════════════════════════════════════════
-for k,v in {"raw_df":None,"skus":{},"results":{},"run_complete":False}.items():
+for k,v in {"raw_df":None,"skus":{},"results":{},"run_complete":False,"partial_results":{}}.items():
     if k not in st.session_state: st.session_state[k]=v
 
 @st.cache_data(show_spinner=False)
@@ -582,7 +582,7 @@ def render_sidebar():
         st.markdown('<div class="sb-section">🎯 Optimization</div>',unsafe_allow_html=True)
         cfg["optim_method"]=st.selectbox("Method",["random","optuna","grid"],
             format_func=lambda x:{"random":"Random search","optuna":"Optuna (Bayesian)","grid":"Grid search"}[x])
-        cfg["n_trials"]=st.number_input("Trials per pipeline",3,100,8)
+        cfg["n_trials"]=st.number_input("Trials per pipeline",1,100,3)
 
         st.divider()
         cfg["can_run"]=bool(st.session_state.get("skus")) and bool(model_sel)
@@ -592,13 +592,21 @@ def render_sidebar():
 # RUN ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 def run_all(cfg):
-    skus=st.session_state["skus"]; results={}; log_lines=[]
+    """Run pipeline with incremental saves — each SKU saved immediately so progress survives resets."""
+    skus=st.session_state["skus"]
+    # Resume from partial results if they exist
+    existing=st.session_state.get("partial_results",{})
+    done_skus=set(existing.keys())
+    log_lines=[]; results=dict(existing)
     status_box=st.empty(); prog=st.progress(0.0,"Starting…"); log_area=st.empty()
     def log(msg,kind="run"):
         log_lines.append(f'<div class="log-{kind}">{msg}</div>')
         log_area.markdown(f'<div class="status-log">{"".join(log_lines[-25:])}</div>',unsafe_allow_html=True)
     n_skus=len(skus)
     for i,(sku_id,sku_df) in enumerate(skus.items()):
+        prog.progress(i/n_skus,text=f"SKU {i+1}/{n_skus}")
+        if sku_id in done_skus:
+            log(f"⏭ {sku_id}: already done (skipping)","ok"); continue
         status_box.markdown(
             f'<div style="background:#1c1a32;border:1px solid #2a2750;border-radius:10px;padding:12px 18px">'
             f'<span style="color:#a78bfa">Processing:</span> <strong style="color:#f0ecff">{sku_id}</strong>'
@@ -610,13 +618,17 @@ def run_all(cfg):
                 optim_method=cfg["optim_method"],n_trials=cfg["n_trials"],
                 horizon=cfg["horizon"],seed=cfg["seed"],status_fn=lambda m:log(m,"run"))
             results[sku_id]=r
+            # Save immediately so a crash doesn't lose this SKU
+            st.session_state["partial_results"]=dict(results)
             best=r.get("best")
-            if best: log(f"✓ {sku_id}: BEST = {best['model']} ({cfg['metric']}={best['score']:.3f})","ok")
+            if best: log(f"✓ {sku_id}: BEST={best['model']} {cfg['metric']}={best['score']:.2f}","ok")
             else:    log(f"⚠ {sku_id}: No successful pipelines","err")
         except Exception as e:
             log(f"✗ {sku_id}: {e}","err")
         prog.progress((i+1)/n_skus,text=f"SKU {i+1}/{n_skus} complete")
     prog.progress(1.0,text="✅ All complete!"); status_box.empty()
+    # Clear partial cache on full completion
+    st.session_state["partial_results"]={}
     return results
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -785,10 +797,16 @@ def main():
         st.warning("❌ No valid data. Check column selections in the sidebar."); return
 
     n_pipes=len(cfg.get("cleaning_methods",[]))*len(cfg.get("models",[]))
-    col_run,col_info=st.columns([2,3])
+    col_run,col_info,col_clear=st.columns([2,2,1])
     with col_run:
         run_clicked=st.button("🚀 Run Full Comparison",use_container_width=True,
             disabled=not cfg.get("can_run",False))
+    with col_clear:
+        if st.button("🔄 Reset",use_container_width=True):
+            st.session_state["results"]={}
+            st.session_state["partial_results"]={}
+            st.session_state["run_complete"]=False
+            st.rerun()
     with col_info:
         st.markdown(f'<div style="padding:10px;color:#9d94c8;font-size:13px">'
             f'{len(skus)} SKU(s) · {len(cfg.get("cleaning_methods",[]))} cleaning × '
@@ -796,12 +814,16 @@ def main():
             f'<strong style="color:#a78bfa">{n_pipes} pipelines/SKU</strong></div>',
             unsafe_allow_html=True)
 
+    partial=st.session_state.get("partial_results",{})
+    if partial and not st.session_state.get("run_complete"):
+        st.info(f"⏸ {len(partial)}/{len(skus)} SKUs completed from last run. Click Run to continue from where it stopped.")
+
     if run_clicked:
         with st.expander("▶ Progress log",expanded=True):
             results=run_all(cfg)
         st.session_state["results"]=results
         st.session_state["run_complete"]=True
-        st.success(f"✅ Done! {len(skus)} SKU(s) processed.")
+        st.success(f"✅ Done! {len(results)} SKU(s) processed.")
         st.rerun()
 
     if st.session_state.get("run_complete") and st.session_state.get("results"):
