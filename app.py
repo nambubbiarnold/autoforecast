@@ -333,12 +333,151 @@ class ProphetForecaster:
         return {"changepoint_prior_scale":[0.001,0.01,0.05,0.1,0.5],
                 "seasonality_prior_scale":[0.01,1.0,10.0],"seasonality_mode":["additive","multiplicative"]}
 
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA QUALITY — AUTO TRIM LEADING ZEROS
+# ══════════════════════════════════════════════════════════════════════════════
+def detect_launch_date(df: pd.DataFrame, max_leading_zero_run: int = 3) -> dict:
+    """
+    Detect the effective launch date by finding the end of the leading-zero period.
+    Returns dict with: trimmed_df, launch_date, original_rows, trimmed_rows,
+                       leading_zeros_removed, status
+    Rules:
+      - Find the last position where there is a run of >= max_leading_zero_run consecutive zeros
+        starting from the beginning of the series.
+      - Everything before and including that run is pre-launch and gets removed.
+      - If fewer than 12 usable rows remain after trimming, flag as INSUFFICIENT.
+    """
+    y = df["y"].values
+    n = len(y)
+    cut = 0  # index from which real data starts
+
+    # Walk through finding runs of consecutive zeros from start
+    i = 0
+    while i < n:
+        if y[i] == 0:
+            # Find end of this zero run
+            j = i
+            while j < n and y[j] == 0:
+                j += 1
+            run_len = j - i
+            # Only trim if this run starts within the first half of the series
+            # AND it's a long run (>= threshold) — keeps genuine sparse months
+            if i == cut and run_len >= max_leading_zero_run:
+                cut = j  # advance cut past this zero run
+            i = j
+        else:
+            i += 1
+
+    trimmed_df = df.iloc[cut:].reset_index(drop=True)
+    usable = len(trimmed_df)
+    removed = cut
+    launch_date = trimmed_df["ds"].iloc[0] if usable > 0 else df["ds"].iloc[0]
+
+    if usable < 12:
+        status = "INSUFFICIENT"
+    elif removed > 0:
+        status = "TRIMMED"
+    else:
+        status = "OK"
+
+    return {
+        "trimmed_df":        trimmed_df,
+        "launch_date":       launch_date,
+        "original_rows":     n,
+        "usable_rows":       usable,
+        "leading_zeros_removed": removed,
+        "status":            status,
+    }
+
+def build_data_quality_report(skus: dict, min_months: int = 12) -> pd.DataFrame:
+    """Build a data quality report for all SKUs before running forecasts."""
+    rows = []
+    for sku_id, df in skus.items():
+        info = detect_launch_date(df)
+        zero_pct = int((df["y"] == 0).mean() * 100)
+        non_zero = int((df["y"] > 0).sum())
+        rows.append({
+            "SKU":               sku_id,
+            "Total months":      info["original_rows"],
+            "Usable months":     info["usable_rows"],
+            "Leading zeros cut": info["leading_zeros_removed"],
+            "Launch date":       info["launch_date"].strftime("%Y-%m") if hasattr(info["launch_date"], "strftime") else str(info["launch_date"]),
+            "Zero months (all)": f"{zero_pct}%",
+            "Non-zero months":   non_zero,
+            "Status":            info["status"],
+        })
+    return pd.DataFrame(rows)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CROSTON'S METHOD — for intermittent / sparse demand
+# ══════════════════════════════════════════════════════════════════════════════
+class CrostonForecaster:
+    """
+    Croston's method for intermittent demand.
+    Separately smooths demand size and inter-demand interval,
+    producing a stable non-zero forecast rate.
+    """
+    name = "Croston"
+
+    def __init__(self, seed=42, alpha=0.1, beta=0.1):
+        self.seed   = seed
+        self.params = dict(alpha=alpha, beta=beta)
+        self._rate  = None
+        self._last_date = None
+        self._train = None
+
+    def fit(self, df: pd.DataFrame):
+        y = df["y"].values.astype(float)
+        self._train     = y
+        self._last_date = df["ds"].iloc[-1]
+        alpha = self.params["alpha"]
+        beta  = self.params["beta"]
+
+        # Initialise on first non-zero observation
+        non_zero_idx = np.where(y > 0)[0]
+        if len(non_zero_idx) == 0:
+            self._rate = 0.0
+            return self
+
+        q = float(y[non_zero_idx[0]])   # demand size estimate
+        p = 1.0                          # inter-demand interval estimate
+        last_demand_t = non_zero_idx[0]
+
+        for t in range(non_zero_idx[0] + 1, len(y)):
+            if y[t] > 0:
+                interval = t - last_demand_t
+                q = alpha * y[t]  + (1 - alpha) * q
+                p = beta  * interval + (1 - beta)  * p
+                last_demand_t = t
+
+        self._rate = q / p if p > 0 else 0.0
+        return self
+
+    def predict(self, horizon: int, freq: str = "MS") -> pd.DataFrame:
+        rate  = max(0.0, self._rate)
+        yhat  = np.round(np.full(horizon, rate)).astype(int)
+        ci_w  = int(np.std(self._train) * 0.5) if self._train is not None else 0
+        dates = pd.date_range(
+            start=self._last_date + pd.tseries.frequencies.to_offset(freq),
+            periods=horizon, freq=freq
+        )
+        return pd.DataFrame({
+            "ds":         dates,
+            "yhat":       yhat,
+            "yhat_lower": np.maximum(0, yhat - ci_w),
+            "yhat_upper": yhat + ci_w,
+        })
+
+    def param_grid(self) -> dict:
+        return {"alpha": [0.05, 0.1, 0.2, 0.3], "beta": [0.05, 0.1, 0.2]}
+
 MODEL_REGISTRY = {
     "ARIMA":          ARIMAForecaster,
     "Exp. Smoothing": ESForecaster,
     "XGBoost":        XGBoostForecaster,
     "Theta":          ThetaForecaster,
     "Prophet":        ProphetForecaster,
+    "Croston":        CrostonForecaster,
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -376,11 +515,26 @@ def hyper_search(ModelClass, grid, train_df, test_df, metric_fn, method="random"
 # PIPELINE RUNNER
 # ══════════════════════════════════════════════════════════════════════════════
 def run_sku_pipeline(sku_id, sku_df, cleaning_methods, model_names, metric="SMAPE",
-                     n_test=6, optim_method="random", n_trials=8, horizon=12, seed=42, status_fn=None):
+                     n_test=6, optim_method="random", n_trials=8, horizon=12, seed=42,
+                     auto_trim=True, min_months=12, status_fn=None):
     def log(msg):
         if status_fn: status_fn(msg)
 
+    # ── Auto-trim leading zeros ──────────────────────────────────────────────
+    dq = detect_launch_date(sku_df)
+    if auto_trim and dq["leading_zeros_removed"] > 0:
+        log(f"  {sku_id}: trimmed {dq['leading_zeros_removed']} pre-launch zero months → using from {dq['launch_date'].strftime('%Y-%m')}")
+        sku_df = dq["trimmed_df"]
+
+    # ── Insufficient data check ──────────────────────────────────────────────
+    if dq["usable_rows"] < min_months:
+        log(f"  {sku_id}: only {dq['usable_rows']} usable months after trimming — skipping (need {min_months}+)")
+        return {"sku_id":sku_id,"results":[],"ranked":[],"best":None,
+                "freq":"MS","split":{},"dq":dq,"status":"INSUFFICIENT"}
+
     freq = _infer_freq(sku_df["ds"])
+    # Adjust n_test if series is short after trimming
+    n_test = min(n_test, max(3, len(sku_df) // 5))
     train_df, test_df, train_idx, test_idx = temporal_split(sku_df, n_test=n_test, seed=seed)
     metric_fn = lambda a,p: score(a,p,metric)
     results = []
@@ -451,7 +605,8 @@ def run_sku_pipeline(sku_id, sku_df, cleaning_methods, model_names, metric="SMAP
     ranked = sorted([r for r in results if r["error"] is None], key=lambda x: x["score"])
     return {"sku_id":sku_id,"results":results,"ranked":ranked,
             "best":ranked[0] if ranked else None,"freq":freq,
-            "split":{"train_idx":train_idx,"test_idx":test_idx,"n_test":n_test}}
+            "split":{"train_idx":train_idx,"test_idx":test_idx,"n_test":n_test},
+            "dq":dq,"status":"OK"}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CHARTS
@@ -590,13 +745,20 @@ def render_sidebar():
 
         st.markdown('<div class="sb-section">🤖 Models</div>',unsafe_allow_html=True)
         avail={"ARIMA":_lib_ok("statsmodels"),"Exp. Smoothing":_lib_ok("statsmodels"),
-               "XGBoost":_lib_ok("xgboost"),"Theta":True,"Prophet":_lib_ok("prophet")}
+               "XGBoost":_lib_ok("xgboost"),"Theta":True,"Prophet":_lib_ok("prophet"),
+               "Croston":True}
         model_sel=[]
         for m,ok in avail.items():
             lbl=m if ok else f"{m} *(not installed)*"
-            default=ok and m in ("ARIMA","Exp. Smoothing","XGBoost","Theta")
+            default=ok and m in ("ARIMA","Exp. Smoothing","XGBoost","Theta","Croston")
             if st.checkbox(lbl,value=default,disabled=not ok): model_sel.append(m)
         cfg["models"]=model_sel or ["Theta"]
+
+        st.markdown('<div class="sb-section">🔍 Data Quality</div>',unsafe_allow_html=True)
+        cfg["auto_trim"]=st.toggle("Auto-trim leading zeros (recommended)",value=True,
+            help="Automatically removes pre-launch zero months from each SKU before training. Prevents new products from skewing forecasts.")
+        cfg["min_months"]=st.number_input("Min usable months required",3,36,12,
+            help="SKUs with fewer than this many non-zero months after trimming are flagged as Insufficient and skipped.")
 
         st.markdown('<div class="sb-section">🎯 Optimization</div>',unsafe_allow_html=True)
         cfg["optim_method"]=st.selectbox("Method",["random","optuna","grid"],
@@ -635,7 +797,10 @@ def run_all(cfg):
                 cleaning_methods=cfg["cleaning_methods"],model_names=cfg["models"],
                 metric=cfg["metric"],n_test=cfg["n_test"],
                 optim_method=cfg["optim_method"],n_trials=cfg["n_trials"],
-                horizon=cfg["horizon"],seed=cfg["seed"],status_fn=lambda m:log(m,"run"))
+                horizon=cfg["horizon"],seed=cfg["seed"],
+                auto_trim=cfg.get("auto_trim",True),
+                min_months=cfg.get("min_months",12),
+                status_fn=lambda m:log(m,"run"))
             results[sku_id]=r
             # Save immediately so a crash doesn't lose this SKU
             st.session_state["partial_results"]=dict(results)
@@ -656,7 +821,7 @@ def run_all(cfg):
 def render_results(results, metric_name):
     if not results: st.warning("No results."); return
 
-    tab_sum,tab_fc,tab_det,tab_rep=st.tabs(["📊 Summary","📈 Forecast","🔬 Model Details","🔁 Reproducibility"])
+    tab_sum,tab_fc,tab_det,tab_dq,tab_rep=st.tabs(["📊 Summary","📈 Forecast","🔬 Model Details","🔎 Data Quality","🔁 Reproducibility"])
 
     # Build summary rows
     rows=[]
@@ -860,6 +1025,78 @@ def render_results(results, metric_name):
                 with st.expander("⚙️ Best hyperparameters"):
                     st.json(best.get("params",{}))
 
+    # ── Data Quality tab ──────────────────────────────────────────────────
+    with tab_dq:
+        st.markdown("#### 🔎 Data Quality Report")
+        st.markdown(
+            "This table shows how each SKU's data was assessed before forecasting. "
+            "Leading pre-launch zeros are automatically removed so models only learn from real demand. "
+            "SKUs flagged **INSUFFICIENT** were skipped — they don't have enough usable history.")
+
+        dq_rows = []
+        for sku_id, data in results.items():
+            dq = data.get("dq", {})
+            status = data.get("status", "OK")
+            dq_rows.append({
+                "SKU":               sku_id,
+                "Status":            status,
+                "Total months":      dq.get("original_rows", "—"),
+                "Leading zeros cut": dq.get("leading_zeros_removed", 0),
+                "Usable months":     dq.get("usable_rows", "—"),
+                "Effective launch":  dq.get("launch_date", pd.NaT),
+                "Pipelines run":     len(data.get("results", [])),
+                "Best model":        data["best"]["model"] if data.get("best") else "N/A",
+            })
+        if dq_rows:
+            dq_df = pd.DataFrame(dq_rows)
+            # Colour-code status
+            def style_status(val):
+                if val == "INSUFFICIENT": return "background-color:#7f1d1d;color:white"
+                if val == "TRIMMED":      return "background-color:#78350f;color:white"
+                return "background-color:#14532d;color:white"
+            st.dataframe(dq_df, use_container_width=True, hide_index=True)
+
+        # Summary counts
+        statuses = [data.get("status","OK") for data in results.values()]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("✅ Full data", statuses.count("OK"))
+        c2.metric("✂️ Trimmed (launch zeros removed)", statuses.count("TRIMMED"))
+        c3.metric("⛔ Insufficient data (skipped)", statuses.count("INSUFFICIENT"))
+
+        if any(s == "INSUFFICIENT" for s in statuses):
+            insuf = [sid for sid, d in results.items() if d.get("status") == "INSUFFICIENT"]
+            st.warning(
+                f"**{len(insuf)} SKU(s) skipped due to insufficient data after trimming:** "
+                f"{', '.join(insuf)}. "
+                f"Lower the 'Min usable months' setting in the sidebar, or "
+                f"provide more historical data for these products.")
+
+        if any(s == "TRIMMED" for s in statuses):
+            trimmed = [(sid, results[sid]["dq"].get("leading_zeros_removed",0),
+                        results[sid]["dq"].get("launch_date",""))
+                       for sid in results if results[sid].get("status") == "TRIMMED"]
+            with st.expander("📋 Trimmed SKUs detail"):
+                for sid, cut, ld in sorted(trimmed, key=lambda x: -x[1]):
+                    launch_str = ld.strftime("%b %Y") if hasattr(ld,"strftime") else str(ld)
+                    st.caption(f"**{sid}**: {cut} pre-launch zero months removed · effective launch {launch_str}")
+
+        # Croston recommendation
+        sparse_skus = []
+        for sku_id, data in results.items():
+            dq = data.get("dq", {})
+            usable = dq.get("usable_rows", 39)
+            df_tmp = data.get("best", {}).get("train_df")
+            if df_tmp is not None:
+                zero_pct = (df_tmp["y"] == 0).mean()
+                if zero_pct > 0.25:
+                    sparse_skus.append(sku_id)
+        if sparse_skus:
+            st.info(
+                f"💡 **Croston's method recommended** for: {', '.join(sparse_skus)}. "
+                f"These SKUs have >25% zero-sales months even after trimming — "
+                f"Croston handles intermittent demand better than ARIMA or Prophet. "
+                f"Make sure Croston is checked in the Models section and re-run.")
+
     # ── Reproducibility tab ───────────────────────────────────────────────
     with tab_rep:
         repro=build_repro(results)
@@ -905,6 +1142,19 @@ def main():
         st.warning("❌ No valid data. Check column selections in the sidebar."); return
 
     n_pipes=len(cfg.get("cleaning_methods",[]))*len(cfg.get("models",[]))
+    # ── Pre-run data quality preview ────────────────────────────────────────
+    if skus:
+        dq_report = build_data_quality_report(skus)
+        insuf = dq_report[dq_report["Status"]=="INSUFFICIENT"]
+        trimmed = dq_report[dq_report["Status"]=="TRIMMED"]
+        if not insuf.empty:
+            st.warning(f"⚠️ {len(insuf)} SKU(s) may have insufficient data after trimming: "
+                f"{', '.join(insuf['SKU'].tolist())}. They will be skipped unless you lower "
+                f"'Min usable months' in the sidebar.")
+        if not trimmed.empty:
+            st.info(f"✂️ {len(trimmed)} SKU(s) will have pre-launch zero months auto-removed: "
+                f"{', '.join(trimmed['SKU'].tolist())}.")
+
     col_run,col_info,col_clear=st.columns([2,2,1])
     with col_run:
         run_clicked=st.button("🚀 Run Full Comparison",use_container_width=True,
